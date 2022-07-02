@@ -1,0 +1,16 @@
+Source: i3-swap-focus
+Section: x11
+Priority: optional
+Maintainer: Regolith Linux <regolith.linux@gmail.com>
+Build-Depends: debhelper (>= 11)
+Standards-Version: 4.1.3
+Homepage: https://github.com/olivierlemoal/i3-swap-focus
+
+Package: i3-swap-focus
+Architecture: any
+Depends: ${misc:Depends},
+    python3 (>= 3.5),
+    python3-i3ipc
+Description: Script to navigate to previous window
+ An i3 script intended to be called by keybinding
+ to open next available empty workspace.
