@@ -1,3 +1,10 @@
+i3-swap-focus (0.4.5) focal; urgency=medium
+
+  [ Khosrow Moossavi ]
+  * feat: use build-only to test pull request
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Mon, 13 Oct 2025 18:25:36 +0000
+
 i3-swap-focus (0.4.4) focal; urgency=medium
 
   [ Ken Gilmer ]
