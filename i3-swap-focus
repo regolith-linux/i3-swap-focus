@@ -29,8 +29,22 @@ async def on_signal(i3):
         await i3.command(cmd)
 
 
-def exit_handler():
-    os.remove(pid_file)
+def remove_pid_file():
+    """Remove the PID file, unless another instance has replaced it."""
+    try:
+        with open(pid_file) as file:
+            if file.read().strip() != str(os.getpid()):
+                return
+        os.remove(pid_file)
+    except FileNotFoundError:
+        pass
+
+
+def on_terminate(signum):
+    """Clean up, then die from the same signal so the exit status is kept."""
+    remove_pid_file()
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
 
 
 def on_window(conn, event):
@@ -46,11 +60,13 @@ def on_window(conn, event):
 async def main():
     with open(pid_file, 'w') as file:
         file.write(str(os.getpid()))
-    atexit.register(exit_handler)
+    atexit.register(remove_pid_file)
+    loop = asyncio.get_event_loop()
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(signum, on_terminate, signum)
 
     i3 = await Connection(auto_reconnect=True).connect()
 
-    loop = asyncio.get_event_loop()
     loop.add_signal_handler(signal.SIGUSR1, lambda: asyncio.create_task(on_signal(i3)))
     i3.on('window::focus', on_window)
     await i3.main()
