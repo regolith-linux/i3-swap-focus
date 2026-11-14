@@ -1,3 +1,10 @@
+i3-swap-focus (0.4.6) focal; urgency=medium
+
+  [ rego-port-bot ]
+  * fix: remove the PID file when the daemon is stopped by a signal
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Fri, 13 Nov 2026 16:14:44 -0800
+
 i3-swap-focus (0.4.5) focal; urgency=medium
 
   [ Khosrow Moossavi ]
