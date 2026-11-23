@@ -5,30 +5,725 @@ import asyncio
 import argparse
 import fcntl
 import signal
+import socket
+import struct
 import sys
 import atexit
+import weakref
 from i3ipc.aio import Connection
 
+IGNORE_MARK = 'ignore_focus'
+# The window events that can change the window manager's focus order.
+ORDER_CHANGES = frozenset(('new', 'focus', 'close', 'move', 'floating'))
+
+# While window events are still arriving, a press first waits for the window
+# manager to settle, so that a window that has just closed is usually out of
+# the way before a target is chosen: until no window event has arrived for
+# QUIET_DELAY, but never longer than SETTLE_LIMIT after the signal. A press
+# made while nothing is happening is carried out at once. Waiting only saves a
+# second focus change; correctness does not depend on it, because a press
+# keeps watching the window that held focus and the window it went to until
+# PRESS_BUDGET after the signal (see watch_press).
+QUIET_DELAY = 0.1
+SETTLE_LIMIT = 0.4
+# A press is settled by this long after the signal: no focus change for it is
+# started later, which leaves room within the one second it is allowed.
+PRESS_BUDGET = 0.8
+# Whether the window manager is still there is decided by watching its process
+# (see watch_manager): an in-place i3 restart keeps the process, and its death
+# ends the daemon at once, whatever the connection is doing. Only when the
+# process cannot be watched do these limits decide instead: how long to wait
+# for i3 to answer again after it announced a restart, and how long to keep
+# trying after a disconnect that was not announced (i3 can restart again
+# before the daemon has resubscribed after a previous restart).
+RESTART_TIMEOUT = 10.0
+DISCONNECT_GRACE = 1.0
+RECONNECT_INTERVAL = 0.05
+
+# Focus history, most recent first, as window keys (see window_key).
+window_stack = []
+# The window manager's record of the focus order (see focus_record) as last
+# seen while connected, as window keys. It outlives a connection, so that the
+# next one can tell which windows were focused while nobody was listening.
+# Window events update it at once (see note_event); a fresh copy of the record
+# then replaces it, so it never lags behind an event that has been handled.
+seen_record = []
+record_changed = None
+# Focus, close and move events handled since the copy of the record being
+# fetched was asked for, as (change, key, marked); the copy may or may not
+# include them.
+recent_events = []
+# Windows that were moved (to another container, workspace, the scratchpad, or
+# in or out of floating) since the last fresh copy of the record. Such a move
+# can put a window at the head of a container's focus list without focusing
+# it, and the copy of the record does not show the move yet, so these windows
+# are never taken as focused in between (see sync_with_tree).
+moved_keys = set()
+stay_in_workspace = False
 pid_file = None
 pid_fd = None
-window_stack = []
+
+i3 = None
+# The process of the window manager the daemon serves, once it is watched, and
+# an event set when that process has gone.
+manager_pid = None
+manager_gone = None
+connected = None
+# Set once the current connection to the window manager has gone away.
+lost = None
+press_lock = None
+shutdown_reason = None
+last_event = 0.0
+# What a press has to know as of the moment it arrives, kept up to date from
+# events so that it can be read at once in the signal handler: the focused
+# workspace (see WorkspaceRef) and the windows carrying the ignore mark.
+focused_workspace = None
+workspace_refs = weakref.WeakSet()
+marked_keys = set()
+# One request lock per connection (see request_lock).
+request_locks = weakref.WeakKeyDictionary()
+# Every window close bumps close_count and records the window in closed_at;
+# close_signal is set and replaced so that a press can wait for the next one.
+close_count = 0
+closed_at = {}
+close_signal = None
+# Set and replaced when a press arrives; presses_waiting counts presses that
+# have arrived but not yet started, so that a running press stops watching.
+press_arrived = None
+presses_waiting = 0
 
 
-async def on_signal(i3):
-    if window_stack:
-        window_id = window_stack.pop()
+class WorkspaceRef:
+    """One workspace, followed through renames.
+
+    Within a connection a workspace keeps its id, whatever it is renamed to;
+    an in-place i3 restart gives it a new id but keeps its name, so a
+    reference made on an earlier connection matches by name instead.
+    """
+
+    def __init__(self, conn, workspace):
+        self.conn, self.id, self.name = conn, workspace.id, workspace.name
+        workspace_refs.add(self)
+
+    def matches(self, conn, workspace):
+        if workspace is None:
+            return False
+        if conn is self.conn:
+            return workspace.id == self.id
+        return workspace.name == self.name
+
+
+def window_key(con):
+    """Identify a window in a way that survives an in-place i3 restart.
+
+    i3 gives every container a new id when it restarts, but an X11 window
+    keeps its window id, so X11 windows are remembered by window id. Native
+    Wayland windows on sway, which never restarts in place, are remembered by
+    their container id.
+    """
+    if con.window:
+        return ('window', con.window)
+    return ('con', con.id)
+
+
+def is_window(con):
+    return con is not None and con.type in ('con', 'floating_con') \
+        and bool(con.window or con.pid or con.app_id)
+
+
+def remember(key):
+    if key in window_stack:
+        window_stack.remove(key)
+    window_stack.insert(0, key)
+
+
+def forget(key):
+    if key in window_stack:
+        window_stack.remove(key)
+
+
+def focus_children(con):
+    """Return the children of con, the one that last held focus first."""
+    children = {child.id: child for child in con.nodes + con.floating_nodes}
+    order = [children.pop(con_id) for con_id in con.focus if con_id in children]
+    return order + list(children.values())
+
+
+def focus_record(con):
+    """Yield the windows below con, most recently focused first.
+
+    Every container lists its children in the order they last held focus;
+    following those lists down from the root gives the window manager's own
+    record of the focus order.
+    """
+    for child in focus_children(con):
+        if is_window(child):
+            yield child
+        else:
+            yield from focus_record(child)
+
+
+def focused_since(con, seen):
+    """Return the windows below con focused since the record in seen.
+
+    seen maps the windows of the focus record as last seen to their places
+    in it. Each container lists its children most recently focused first, so
+    the children focused since then are the ones ahead of the longest tail of
+    its list still in the earlier order, and each of them was focused after
+    the one behind it. Children holding only windows new since then never
+    had focus if they sit behind that tail. Most recent first; the order of
+    windows from different children follows the record.
+    """
+    branches = []
+    for child in focus_children(con):
+        if is_window(child):
+            keys = [window_key(child)]
+        else:
+            keys = [window_key(window) for window in focus_record(child)]
+        if keys:
+            places = [seen[key] for key in keys if key in seen]
+            branches.append((child, keys, min(places, default=None)))
+    known = [index for index, branch in enumerate(branches) if branch[2] is not None]
+    cut = known[-1] if known else len(branches)
+    while 0 < cut < len(branches) and branches[cut - 1][2] is not None \
+            and branches[cut - 1][2] < branches[cut][2]:
+        cut -= 1
+    focused = []
+    for index, (child, keys, place) in enumerate(branches):
+        head = []
+        if index < cut:
+            head = [keys[0]]
+            focused += head
+        if not is_window(child) and (index < cut or place is not None):
+            focused += [key for key in focused_since(child, seen) if key not in head]
+    return focused
+
+
+def note_event(change, key):
+    """Bring seen_record up to date with one window event.
+
+    Focusing a window moves it to the front of the focus list of every
+    container above it, and a closed window leaves them all. Moving the
+    window to the front of seen_record, or dropping it, changes the order of
+    the children of every container in seen_record in exactly that way, and
+    that order is all focused_since reads. A move changes the record in a
+    way seen_record cannot show until the next fresh copy, so the window is
+    noted in moved_keys until then; a later focus of it is again exact.
+    """
+    if change == 'move':
+        moved_keys.add(key)
+        return
+    moved_keys.discard(key)
+    if key in seen_record:
+        seen_record.remove(key)
+    if change == 'focus':
+        seen_record.insert(0, key)
+
+
+def replay_events(events):
+    """Apply events again after a copy of the record that may predate them.
+
+    Applying an event a second time leaves both orders as they were, so
+    events that the copy already includes do no harm.
+    """
+    for change, key, marked in events:
+        note_event(change, key)
+        if change == 'close':
+            forget(key)
+        elif change == 'focus' and not marked:
+            remember(key)
+
+
+def sync_with_tree(tree, prior):
+    """Drop windows that are gone and catch up with the focus record.
+
+    prior is the record as last seen before this connection. Windows the
+    record shows were focused while the daemon was not listening (before it
+    started, or while i3 was restarting) move to the front, most recent
+    first, as if their focus had been seen; the rest keep their order.
+    Events seen on this connection while the tree was fetched come after.
+
+    A window moved since the last fresh copy of the record (see moved_keys)
+    may head a focus list only because it was moved there, so it is left out
+    of the comparison and never taken as focused: it keeps its place.
+    """
+    windows = {window_key(con): con for con in tree if is_window(con)}
+    window_stack[:] = [key for key in window_stack if key in windows]
+    seen = {key: place for place, key in enumerate(prior) if key not in moved_keys}
+    for key in reversed(focused_since(tree, seen)):
+        if IGNORE_MARK not in windows[key].marks and key not in moved_keys:
+            remember(key)
+    seen_record[:] = [window_key(con) for con in focus_record(tree)]
+    moved_keys.clear()
+    replay_events(recent_events)
+    marked_keys.clear()
+    marked_keys.update(key for key, con in windows.items() if IGNORE_MARK in con.marks)
+
+
+def note_workspace(conn, tree):
+    global focused_workspace
+    focused = tree.find_focused()
+    workspace = focused.workspace() if focused is not None else None
+    if workspace is not None:
+        focused_workspace = WorkspaceRef(conn, workspace)
+
+
+def request_lock(conn):
+    """Return the lock that keeps requests on conn to one at a time.
+
+    i3ipc.aio matches replies to requests only by order, so two requests in
+    flight on one connection at once could swap their replies.
+    """
+    lock = request_locks.get(conn)
+    if lock is None:
+        lock = request_locks[conn] = asyncio.Lock()
+    return lock
+
+
+async def get_tree(conn):
+    async with request_lock(conn):
+        return await conn.get_tree()
+
+
+async def run_command(conn, command):
+    async with request_lock(conn):
+        return await conn.command(command)
+
+
+async def track_record(conn):
+    """Keep seen_record up to date for as long as conn lasts.
+
+    A fresh copy is fetched as soon as a window event arrives, also while a
+    press is under way, so that the copy an in-place restart leaves behind
+    is never older than a few milliseconds.
+    """
+    while True:
+        await record_changed.wait()
+        record_changed.clear()
+        recent_events.clear()
+        try:
+            tree = await get_tree(conn)
+        except Exception:
+            return
+        seen_record[:] = [window_key(con) for con in focus_record(tree)]
+        moved_keys.clear()
+        for change, key, _ in recent_events:
+            note_event(change, key)
+
+
+def note_close(key):
+    global close_count, close_signal
+    close_count += 1
+    closed_at[key] = close_count
+    if len(closed_at) > 256:
+        for old in [old for old, count in closed_at.items() if count < close_count - 128]:
+            del closed_at[old]
+    close_signal.set()
+    close_signal = asyncio.Event()
+
+
+def on_window(conn, event):
+    global last_event
+    key = window_key(event.container)
+    marked = IGNORE_MARK in event.container.marks
+    if marked and event.change != 'close':
+        marked_keys.add(key)
+    else:
+        marked_keys.discard(key)
+    if event.change not in ORDER_CHANGES:
+        # Title, mark, urgency and fullscreen changes can arrive many times a
+        # second (a terminal showing progress in its title) and leave the
+        # focus order alone: they neither refresh the record nor hold up a
+        # press that is waiting for the window manager to settle.
+        return
+    last_event = asyncio.get_running_loop().time()
+    record_changed.set()
+    if event.change in ('focus', 'close'):
+        recent_events.append((event.change, key, marked))
+    elif event.change in ('move', 'floating'):
+        recent_events.append(('move', key, marked))
+        note_event('move', key)
+    if event.change == 'close':
+        note_event('close', key)
+        forget(key)
+        note_close(key)
+    elif event.change == 'focus':
+        note_event('focus', key)
+        if not marked:
+            remember(key)
+
+
+def on_workspace(conn, event):
+    global focused_workspace
+    current = event.current
+    if current is None:
+        return
+    if event.change == 'focus':
+        focused_workspace = WorkspaceRef(conn, current)
+    elif event.change == 'rename':
+        for ref in list(workspace_refs):
+            if ref.conn is conn and ref.id == current.id:
+                ref.name = current.name
+
+
+def on_shutdown(conn, event):
+    global shutdown_reason
+    shutdown_reason = event.change
+    if event.change == 'exit':
+        conn.main_quit()
+
+
+def choose_target(conn, tree, workspace, exclude, marked):
+    """Return the first window in the history a press may go to, or None.
+
+    workspace is the workspace focused when the press arrived (a WorkspaceRef)
+    and marked the windows marked then; a window marked now is passed over too.
+    """
+    focused = tree.find_focused()
+    current = window_key(focused) if is_window(focused) else None
+    windows = {window_key(con): con for con in tree if is_window(con)}
+    for key in list(window_stack):
+        if key == current or key in exclude:
+            continue
+        con = windows.get(key)
+        if con is None:
+            forget(key)
+            continue
+        if key in marked or IGNORE_MARK in con.marks:
+            continue
         if stay_in_workspace:
-            current_workspace = (await i3.get_tree()).find_focused().workspace().id
-            container = (await i3.get_tree()).find_by_id(window_id)
-            if not container:
-                window_stack.append(window_id)
+            if workspace is None or not workspace.matches(conn, con.workspace()):
+                continue
+        return con
+    return None
+
+
+def manager_landings(window):
+    """Yield the windows the manager may focus when window, focused, closes.
+
+    Both managers move focus to the most recently focused window that shares
+    the nearest enclosing container with it, looking no further than its
+    workspace; when the workspace has nothing else, the workspace itself is
+    focused. Floating windows take part in the same order: a workspace lists
+    its floating containers among its children. The first window yielded is
+    where focus lands; should it close first, the next one, and so on.
+    """
+    node = window
+    while node is not None and node.parent is not None and node.type != 'workspace':
+        parent = node.parent
+        for child in focus_children(parent):
+            if child.id == node.id:
+                continue
+            if is_window(child):
+                yield child
+            else:
+                yield from focus_record(child)
+        if parent.type == 'workspace':
+            return
+        node = parent
+
+
+def place_behind(key, front):
+    """Move key in the history to just behind front (key is not front)."""
+    if key is None or key == front or key not in window_stack:
+        return
+    window_stack.remove(key)
+    index = window_stack.index(front) + 1 if front in window_stack else 0
+    window_stack.insert(index, key)
+
+
+async def settle(start, deadline):
+    """Wait until no window event has arrived for QUIET_DELAY (see above)."""
+    loop = asyncio.get_running_loop()
+    limit = min(start + SETTLE_LIMIT, deadline)
+    while True:
+        wait = min(last_event + QUIET_DELAY, limit) - loop.time()
+        if wait <= 0:
+            return
+        await asyncio.sleep(wait)
+
+
+async def focus_next(conn, tree, workspace, tried, marked, deadline):
+    """Focus the first eligible window not yet tried; return its key or None.
+
+    A window that vanishes before it takes focus is passed over, as long as
+    there is time left. The first attempt is always made.
+    """
+    loop = asyncio.get_running_loop()
+    while True:
+        target = choose_target(conn, tree, workspace, tried, marked)
+        if target is None:
+            return None
+        key = window_key(target)
+        tried.add(key)
+        replies = await run_command(conn, f'[con_id={target.id}] focus')
+        if replies and replies[0].success:
+            return key
+        if loop.time() >= deadline:
+            return None
+        await settle(loop.time(), deadline)
+        tree = await get_tree(conn)
+
+
+async def wait_for_close(since, deadline, gone):
+    """Wait for a window to close after close number since.
+
+    Returns False when the deadline passes, the connection goes away or
+    another press arrives first.
+    """
+    loop = asyncio.get_running_loop()
+    while close_count <= since:
+        remaining = deadline - loop.time()
+        if remaining <= 0 or gone.is_set() or presses_waiting:
+            return False
+        waits = [asyncio.ensure_future(event.wait())
+                 for event in (close_signal, gone, press_arrived)]
+        try:
+            await asyncio.wait(waits, timeout=remaining,
+                               return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for waiter in waits:
+                waiter.cancel()
+    return True
+
+
+async def watch_press(conn, gone, deadline, workspace, tried, marked,
+                      origin, landings, held, since):
+    """Keep a press right while the windows it depends on may still close.
+
+    origin is the window that held focus when the press was decided and held
+    the window the press went to. A polite close can be pending when the
+    press is decided: the window is still on screen and nothing in the
+    manager's state tells it apart from any other. The press therefore keeps
+    watching both windows until its deadline.
+
+    When origin closes, the press is decided again from the picture that
+    follows: had the press not moved focus first, the manager would have
+    moved it to its landing, the first window of landings (see
+    manager_landings) that has not closed since the press was decided, and
+    the press would then have gone to the first eligible window other than
+    the landing. That is held itself unless held is the landing; then the
+    press moves on to the next eligible window. Otherwise the landing,
+    focused by the manager in that picture, goes behind held in the history.
+
+    When held closes, the manager moves focus on its own, and the press moves
+    on down the history, as when a window closes before it can take focus.
+    """
+    loop = asyncio.get_running_loop()
+    decided = since
+
+    def closed(key):
+        return key is not None and closed_at.get(key, 0) > since
+
+    def landing_now():
+        return next((key for key in landings if closed_at.get(key, 0) <= decided), None)
+
+    while held is not None and await wait_for_close(since, deadline, gone):
+        if not closed(origin) and not closed(held):
+            since = close_count
+            continue
+        # Let the manager finish reacting before looking again.
+        await settle(loop.time(), deadline)
+        origin_gone, held_gone = closed(origin), closed(held)
+        since = close_count
+        if origin_gone:
+            origin = None
+        tree = await get_tree(conn)
+        focused = tree.find_focused()
+        current = window_key(focused) if is_window(focused) else None
+        if not held_gone:
+            if current != held:
+                # Focus has moved on since; the press has been overtaken.
                 return
-            window_workspace = container.workspace().id
-            if current_workspace != window_workspace:
-                window_stack.append(window_id)
+            landing = landing_now()
+            if landing != held:
+                place_behind(landing, held)
+                continue
+        held = await focus_next(conn, tree, workspace, tried, marked, deadline)
+
+
+async def swap_focus(conn, gone, start, workspace, marked):
+    deadline = start + PRESS_BUDGET
+    await settle(start, deadline)
+    since = close_count
+    tree = await get_tree(conn)
+    focused = tree.find_focused()
+    if workspace is None:
+        # A press that arrived while i3 could not be reached keeps to the
+        # workspace focused once it answers again.
+        focused_ws = focused.workspace() if focused is not None else None
+        workspace = WorkspaceRef(conn, focused_ws) if focused_ws is not None else None
+    origin = focused if is_window(focused) else None
+    landings = [window_key(con) for con in manager_landings(origin)] \
+        if origin is not None else []
+    tried = set()
+    held = await focus_next(conn, tree, workspace, tried, marked, deadline)
+    if held is None:
+        # No window qualified, and none will once the windows of this
+        # picture close: the press changes nothing.
+        return
+    try:
+        await watch_press(conn, gone, deadline, workspace, tried, marked,
+                          window_key(origin) if origin is not None else None,
+                          landings, held, since)
+    except Exception:
+        # The press has been carried out; only its correction was lost.
+        pass
+
+
+def on_press_signal():
+    """Note what the press needs as of its arrival, then queue it."""
+    global press_arrived, presses_waiting
+    loop = asyncio.get_running_loop()
+    presses_waiting += 1
+    press_arrived.set()
+    press_arrived = asyncio.Event()
+    if connected.is_set():
+        arrival = (loop.time(), focused_workspace, frozenset(marked_keys))
+    else:
+        arrival = None
+    asyncio.ensure_future(on_signal(arrival))
+
+
+async def on_signal(arrival):
+    global presses_waiting
+    loop = asyncio.get_running_loop()
+    async with press_lock:
+        presses_waiting -= 1
+        if arrival is not None:
+            start, workspace, marked = arrival
+        else:
+            start, workspace, marked = None, None, frozenset()
+        while True:
+            # A press that arrives while the window manager cannot be reached
+            # (i3 is restarting) is carried out once it answers again.
+            await connected.wait()
+            conn, gone = i3, lost
+            if start is None:
+                start = loop.time()
+            try:
+                await swap_focus(conn, gone, start, workspace, marked)
                 return
-        cmd = f'[con_id={window_id}] focus'
-        await i3.command(cmd)
+            except Exception:
+                pass
+            # The press failed. If the connection went away under it, carry
+            # it out on the next connection; otherwise give it up.
+            try:
+                await asyncio.wait_for(gone.wait(), DISCONNECT_GRACE)
+            except asyncio.TimeoutError:
+                return
+            start = None
+
+
+def disconnect(conn):
+    """Release both sockets of a connection (i3ipc.aio has no close())."""
+    sub_fd = getattr(conn, '_sub_fd', None)
+    if sub_fd is not None:
+        asyncio.get_running_loop().remove_reader(sub_fd)
+    for name in ('_sub_socket', '_cmd_socket'):
+        sock = getattr(conn, name, None)
+        if sock is not None:
+            sock.close()
+
+
+def peer_pid(conn):
+    """Return the process id of the window manager at the other end, or None."""
+    try:
+        creds = conn._cmd_socket.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i'))
+        pid = struct.unpack('3i', creds)[0]
+    except (AttributeError, OSError, struct.error):
+        return None
+    return pid if pid > 0 else None
+
+
+def watch_manager(pid):
+    """Leave as soon as the window manager process pid has gone.
+
+    A pidfd names that one process, so a restart in place (the same process
+    executing i3 again, however long it takes) keeps it, and its death is seen
+    at once, also while the daemon cannot reach the manager's socket.
+    """
+    global manager_pid
+    try:
+        fd = os.pidfd_open(pid)
+    except (AttributeError, OSError):
+        return
+    manager_pid = pid
+    loop = asyncio.get_running_loop()
+
+    def on_exit():
+        loop.remove_reader(fd)
+        os.close(fd)
+        manager_gone.set()
+        if i3 is not None:
+            i3.main_quit()
+
+    loop.add_reader(fd, on_exit)
+
+
+async def connect(socket_path):
+    global shutdown_reason
+    shutdown_reason = None
+    prior = list(seen_record)
+    recent_events.clear()
+    conn = Connection(socket_path=socket_path)
+    try:
+        await conn.connect()
+        pid = peer_pid(conn)
+        if manager_pid is None:
+            if pid is not None and socket_path is None:
+                # Watched before the first reply, which proves pid was the
+                # manager's when the pidfd was opened.
+                watch_manager(pid)
+        elif pid != manager_pid:
+            # Not the window manager this daemon serves.
+            raise ConnectionError('another process answers on the socket')
+        conn.on('window', on_window)
+        conn.on('workspace', on_workspace)
+        conn.on('shutdown', on_shutdown)
+        await conn.subscribe(['window', 'workspace', 'shutdown'])
+        tree = await get_tree(conn)
+        sync_with_tree(tree, prior)
+        note_workspace(conn, tree)
+    except BaseException:
+        disconnect(conn)
+        raise
+    return conn
+
+
+async def reconnect(socket_path, timeout):
+    """Connect again; None once the manager has gone or timeout has passed.
+
+    timeout None waits for as long as the window manager process lives.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = None if timeout is None else loop.time() + timeout
+    while not manager_gone.is_set():
+        attempt = asyncio.ensure_future(connect(socket_path))
+        gone = asyncio.ensure_future(manager_gone.wait())
+        try:
+            await asyncio.wait({attempt, gone}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            gone.cancel()
+        if not attempt.done():
+            attempt.cancel()
+            try:
+                await attempt
+            except BaseException:
+                pass
+            return None
+        try:
+            return attempt.result()
+        except Exception:
+            pass
+        if deadline is not None and loop.time() >= deadline:
+            return None
+        try:
+            await asyncio.wait_for(manager_gone.wait(), RECONNECT_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+    return None
 
 
 def runtime_dir():
@@ -187,27 +882,63 @@ def on_terminate(signum):
     os.kill(os.getpid(), signum)
 
 
-def on_window(conn, event):
-    if "ignore_focus" in event.container.marks:
-        return
-    if event.change == 'focus':
-        if not window_stack or event.container.id != window_stack[0]:
-            window_stack.insert(0, event.container.id)
-            if len(window_stack) > 2:
-                del window_stack[2:]
-
-
 async def main():
-    loop = asyncio.get_event_loop()
+    global i3, connected, lost, press_lock, record_changed, close_signal, press_arrived
+    global manager_gone
+    loop = asyncio.get_running_loop()
     for signum in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(signum, on_terminate, signum)
+    connected = asyncio.Event()
+    press_lock = asyncio.Lock()
+    record_changed = asyncio.Event()
+    close_signal = asyncio.Event()
+    press_arrived = asyncio.Event()
+    manager_gone = asyncio.Event()
 
-    i3 = await Connection(auto_reconnect=True).connect()
+    try:
+        i3 = await connect(None)
+    except Exception as error:
+        print(f'i3-swap-focus: cannot connect to the window manager: {error}', file=sys.stderr)
+        return 1
+    socket_path = i3.socket_path
+    lost = asyncio.Event()
+    connected.set()
+    tracker = asyncio.ensure_future(track_record(i3))
 
-    loop.add_signal_handler(signal.SIGUSR1, lambda: asyncio.create_task(on_signal(i3)))
+    loop.add_signal_handler(signal.SIGUSR1, on_press_signal)
     write_pid_file()
-    i3.on('window::focus', on_window)
-    await i3.main()
+
+    while True:
+        if not manager_gone.is_set():
+            try:
+                await i3.main()
+            except Exception:
+                pass
+        connected.clear()
+        lost.set()
+        tracker.cancel()
+        disconnect(i3)
+        if shutdown_reason == 'exit' or manager_gone.is_set():
+            return 0
+        if manager_pid is not None:
+            # The manager is still running: it is restarting in place or will
+            # answer again, however long that takes; watch_manager ends the
+            # wait if it dies.
+            timeout = None
+        elif shutdown_reason == 'restart':
+            timeout = RESTART_TIMEOUT
+        else:
+            timeout = DISCONNECT_GRACE
+        conn = await reconnect(socket_path, timeout)
+        if conn is None or manager_gone.is_set():
+            # The window manager is gone for good; leave with it.
+            if conn is not None:
+                disconnect(conn)
+            return 0
+        i3 = conn
+        lost = asyncio.Event()
+        connected.set()
+        tracker = asyncio.ensure_future(track_record(i3))
 
 
 parser = argparse.ArgumentParser(description='i3 script to toggle between last windows.')
@@ -224,4 +955,4 @@ if pid_fd is None:
     # Another copy is already running for this runtime directory.
     sys.exit(0)
 atexit.register(remove_pid_file)
-asyncio.run(main())
+sys.exit(asyncio.run(main()))
