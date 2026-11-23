@@ -42,3 +42,10 @@ This script accepts a ``--stay-in-workspace`` flag if you do not wish to focus o
 ```
 exec i3-swap-focus --stay-in-workspace
 ```
+
+### PID file
+
+The script writes its PID to ``$XDG_RUNTIME_DIR/swap_focus.pid``, falling back
+to ``/run/user/<uid>`` when ``XDG_RUNTIME_DIR`` is not set. Only one copy runs
+per runtime directory: a copy started while another one is running exits
+straight away and leaves the running copy and its PID file alone.

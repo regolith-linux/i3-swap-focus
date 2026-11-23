@@ -3,12 +3,14 @@
 import os
 import asyncio
 import argparse
+import fcntl
 import signal
 import sys
 import atexit
 from i3ipc.aio import Connection
 
-pid_file = '{XDG_RUNTIME_DIR}/swap_focus.pid'.format_map(os.environ)
+pid_file = None
+pid_fd = None
 window_stack = []
 
 
@@ -29,13 +31,151 @@ async def on_signal(i3):
         await i3.command(cmd)
 
 
-def remove_pid_file():
-    """Remove the PID file, unless another instance has replaced it."""
+def runtime_dir():
+    """Return the runtime directory and how to name it in an error."""
+    path = os.environ.get('XDG_RUNTIME_DIR')
+    if path:
+        if os.path.isdir(path):
+            return path, f'XDG_RUNTIME_DIR {path}'
+        sys.exit(f'i3-swap-focus: XDG_RUNTIME_DIR {path} is not a directory')
+    path = f'/run/user/{os.getuid()}'
+    if os.path.isdir(path):
+        return path, f'XDG_RUNTIME_DIR is not set and {path}'
+    sys.exit(f'i3-swap-focus: XDG_RUNTIME_DIR is not set and {path} does not exist')
+
+
+def lock_holders(inode):
+    """Return the pids holding a whole-file lock on inode, or None if unknown.
+
+    A pid of 0 stands for a holder outside this process's pid namespace.
+    """
     try:
-        with open(pid_file) as file:
-            if file.read().strip() != str(os.getpid()):
-                return
-        os.remove(pid_file)
+        with open('/proc/locks') as file:
+            lines = file.read().splitlines()
+    except OSError:
+        return None
+    holders = []
+    for line in lines:
+        # "1: FLOCK  ADVISORY  WRITE 1234 00:2a:5678 0 EOF"; waiters show "->".
+        fields = line.split()
+        if len(fields) < 6 or fields[1] != 'FLOCK':
+            continue
+        try:
+            pid, file_inode = int(fields[4]), int(fields[5].rsplit(':', 1)[-1])
+        except ValueError:
+            continue
+        if file_inode == inode:
+            holders.append(pid)
+    return holders
+
+
+def named_pid(path):
+    try:
+        with open(path, 'rb') as file:
+            text = file.read(64).strip()
+    except OSError:
+        return None
+    return int(text) if text.isdigit() else None
+
+
+def is_running_copy(pid):
+    """Tell whether pid is a live process running this daemon."""
+    if pid is None or pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        with open(f'/proc/{pid}/stat', 'rb') as file:
+            if file.read().rsplit(b')', 1)[-1].split()[0] in (b'Z', b'X'):
+                return False
+        with open(f'/proc/{pid}/cmdline', 'rb') as file:
+            argv = file.read().split(b'\0')
+    except (OSError, IndexError):
+        return False
+    script = os.path.basename(os.fsencode(sys.argv[0]))
+    if os.path.basename(argv[0]).startswith(b'python'):
+        args = [arg for arg in argv[1:] if arg and not arg.startswith(b'-')]
+        return bool(args) and os.path.basename(args[0]) == script
+    return os.path.basename(argv[0]) == script
+
+
+def copy_holds(path, inode):
+    """Tell whether a running copy of the daemon holds the file at path.
+
+    Its lock names the holder; where that is unknown, the process the file
+    names decides.
+    """
+    holders = lock_holders(inode)
+    if holders is None or 0 in holders:
+        return is_running_copy(named_pid(path))
+    return any(is_running_copy(pid) for pid in holders)
+
+
+def remove_stale(path, inode):
+    """Remove the file at path if it is still the one judged stale."""
+    try:
+        if os.stat(path).st_ino == inode:
+            os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def claim_pid_file(path):
+    """Lock the PID file; return its descriptor, or None if a copy holds it.
+
+    The file stands in the way only when a running copy of the daemon holds
+    it; that copy locked it when it started and keeps the lock as long as it
+    runs. A file left behind by a process that is gone, one this copy cannot
+    write, or one locked by some other program, is replaced; whatever process
+    it names is left alone.
+    """
+    while True:
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o666)
+        except PermissionError as error:
+            # A leftover file this copy may not write to, unless the directory
+            # itself refuses the file.
+            try:
+                inode = os.stat(path).st_ino
+            except FileNotFoundError:
+                if not os.access(os.path.dirname(path), os.W_OK | os.X_OK):
+                    raise error from None
+                continue
+            if copy_holds(path, inode):
+                return None
+            remove_stale(path, inode)
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            inode = os.fstat(fd).st_ino
+            os.close(fd)
+            if copy_holds(path, inode):
+                return None
+            if lock_holders(inode) != []:
+                remove_stale(path, inode)
+            continue
+        # The previous holder may have removed the file between open and lock.
+        try:
+            info, held = os.stat(path), os.fstat(fd)
+            if (info.st_dev, info.st_ino) == (held.st_dev, held.st_ino):
+                os.ftruncate(fd, 0)
+                return fd
+        except FileNotFoundError:
+            pass
+        os.close(fd)
+
+
+def write_pid_file():
+    data = str(os.getpid()).encode()
+    os.pwrite(pid_fd, data, 0)
+    os.ftruncate(pid_fd, len(data))
+
+
+def remove_pid_file():
+    """Remove the PID file, unless it is no longer the one this copy holds."""
+    try:
+        info, held = os.stat(pid_file), os.fstat(pid_fd)
+        if (info.st_dev, info.st_ino) == (held.st_dev, held.st_ino):
+            os.remove(pid_file)
     except FileNotFoundError:
         pass
 
@@ -58,9 +198,6 @@ def on_window(conn, event):
 
 
 async def main():
-    with open(pid_file, 'w') as file:
-        file.write(str(os.getpid()))
-    atexit.register(remove_pid_file)
     loop = asyncio.get_event_loop()
     for signum in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(signum, on_terminate, signum)
@@ -68,6 +205,7 @@ async def main():
     i3 = await Connection(auto_reconnect=True).connect()
 
     loop.add_signal_handler(signal.SIGUSR1, lambda: asyncio.create_task(on_signal(i3)))
+    write_pid_file()
     i3.on('window::focus', on_window)
     await i3.main()
 
@@ -75,4 +213,15 @@ async def main():
 parser = argparse.ArgumentParser(description='i3 script to toggle between last windows.')
 parser.add_argument('--stay-in-workspace', action=argparse.BooleanOptionalAction, default=False, help="Do not switch focus if window is on a different workspace")
 stay_in_workspace = parser.parse_args().stay_in_workspace
+directory, described = runtime_dir()
+pid_file = os.path.join(directory, 'swap_focus.pid')
+try:
+    pid_fd = claim_pid_file(pid_file)
+except OSError as error:
+    sys.exit(f'i3-swap-focus: {described} cannot hold the PID file: '
+             f'{error.strerror or error}')
+if pid_fd is None:
+    # Another copy is already running for this runtime directory.
+    sys.exit(0)
+atexit.register(remove_pid_file)
 asyncio.run(main())
