@@ -42,3 +42,23 @@ This script accepts a ``--stay-in-workspace`` flag if you do not wish to focus o
 ```
 exec i3-swap-focus --stay-in-workspace
 ```
+
+### Focus history
+
+The script remembers every window in the order it was focused, most recent
+first. A key press goes to the most recent window that is still open, is not
+the focused one and is not marked ``ignore_focus`` (and, with
+``--stay-in-workspace``, sits on the focused workspace). Closed windows are
+dropped from the history. At startup, and again after an in-place i3 restart,
+the script catches up with the window manager's own record of the focus order,
+so windows focused before it started or while i3 was restarting count. The
+history survives a configuration reload and an in-place i3 restart, and a key
+press made while i3 is restarting is carried out once i3 answers again; when
+the window manager exits, the script exits too and removes its PID file.
+
+### PID file
+
+The script writes its PID to ``$XDG_RUNTIME_DIR/swap_focus.pid``, falling back
+to ``/run/user/<uid>`` when ``XDG_RUNTIME_DIR`` is not set. Only one copy runs
+per runtime directory: a copy started while another one is running exits
+straight away and leaves the running copy and its PID file alone.
